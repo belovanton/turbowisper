@@ -16,7 +16,7 @@ Turbo Whisper is a **free, open source** voice dictation and transcription app f
 ![AUR](https://img.shields.io/aur/version/turbo-whisper)
 ![PPA](https://img.shields.io/badge/PPA-bengweeks%2Fturbo--whisper-orange)
 
-<img width="1554" height="678" alt="image" src="https://github.com/user-attachments/assets/1f2e0447-2152-48d6-99c3-8d49d3053ac8" />
+[Screencast_20260122_152835.webm](https://github.com/user-attachments/assets/0d53b4d5-377c-49bb-9463-24cdfdc02946)
 
 ## Features
 
