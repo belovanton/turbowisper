@@ -26,6 +26,7 @@ class HistoryEntry(TypedDict, total=False):
     text: str
     timestamp: str  # ISO format
     audio_file: str  # Filename (not full path) of WAV recording
+    status: str  # "ok" | "failed" | "empty" — result of transcription attempt
 
 
 @dataclass
@@ -81,6 +82,25 @@ class Config:
         recordings_dir.mkdir(parents=True, exist_ok=True)
         return recordings_dir
 
+    def add_failed_to_history(self, audio_file: str, status: str = "failed") -> None:
+        """Add a failed/empty transcription attempt to history (audio saved, no text).
+
+        Args:
+            audio_file: Filename of the saved WAV recording
+            status: "failed" (API error) or "empty" (no speech detected)
+        """
+        from datetime import datetime
+
+        entry: HistoryEntry = {
+            "text": "",
+            "timestamp": datetime.now().isoformat(),
+            "audio_file": audio_file,
+            "status": status,
+        }
+        self.history.insert(0, entry)
+        self._cleanup_old_recordings()
+        self.save()
+
     def add_to_history(self, text: str, audio_file: str | None = None) -> None:
         """Add a transcription to history.
 
@@ -105,6 +125,7 @@ class Config:
             entry: HistoryEntry = {
                 "text": text,
                 "timestamp": datetime.now().isoformat(),
+                "status": "ok",
             }
             if audio_file:
                 entry["audio_file"] = audio_file

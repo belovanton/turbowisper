@@ -1,0 +1,27 @@
+services:
+  whisper-server:
+    image: fedirz/faster-whisper-server:latest-cpu
+    container_name: turbo-whisper-server
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      WHISPER__MODEL: Systran/faster-whisper-small
+      WHISPER__INFERENCE_DEVICE: cpu
+      # int8 — нет конвертации float16→float32, загрузка в 3-4 раза быстрее
+      WHISPER__COMPUTE_TYPE: int8
+      WHISPER__CPU_THREADS: 4
+      WHISPER__BEAM_SIZE: 5
+      # -1 = никогда не выгружать модель из памяти
+      WHISPER__TTL: -1
+      # Язык по умолчанию
+      DEFAULT_LANGUAGE: ru
+    volumes:
+      # Кеш моделей — чтобы не качать при каждом рестарте
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

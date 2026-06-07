@@ -1,5 +1,6 @@
 """Main application entry point for Turbo Whisper."""
 
+import enum
 import os
 import subprocess
 import sys
@@ -51,6 +52,14 @@ from .typer import Typer
 from .waveform import WaveformWidget
 
 
+class AppState(enum.Enum):
+    IDLE = "idle"
+    RECORDING = "recording"
+    TRANSCRIBING = "transcribing"
+    RESULT = "result"
+    TYPING = "typing"
+
+
 class SignalBridge(QObject):
     """Bridge for thread-safe Qt signals."""
 
@@ -58,7 +67,13 @@ class SignalBridge(QObject):
     update_waveform = pyqtSignal(float, list)
     transcription_complete = pyqtSignal(str)
     transcription_error = pyqtSignal(str)
+    transcription_chunk = pyqtSignal(str)
     show_status = pyqtSignal(str)
+    state_changed = pyqtSignal(str)   # AppState.value string — updates UI only
+    set_app_state = pyqtSignal(str)   # AppState.value string — full _set_state()
+    show_window = pyqtSignal()        # safe show() from background thread
+    hide_window = pyqtSignal()        # safe hide() from background thread
+    tray_message = pyqtSignal(str, str, int)  # title, message, duration_ms
 
 
 class TickMarksWidget(QWidget):
@@ -117,17 +132,25 @@ class RecordingWindow(QWidget):
         # Set window icon for taskbar (orange = idle)
         self.setWindowIcon(get_tray_icon(128, recording=False))
 
-        # Frameless, always on top, floating window that doesn't steal focus
-        # Store base flags for toggling focus behavior
-        self._base_window_flags = (
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
-        )
-        self.setWindowFlags(self._base_window_flags | Qt.WindowType.WindowDoesNotAcceptFocus)
+        # Frameless, always on top, floating window that doesn't steal focus.
+        # On macOS: Tool type lowers window priority below active apps, so we skip it.
+        # WindowStaysOnTopHint works correctly without Tool on macOS.
+        if sys.platform == "darwin":
+            self._base_window_flags = (
+                Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.WindowStaysOnTopHint
+            )
+        else:
+            self._base_window_flags = (
+                Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.WindowStaysOnTopHint
+                | Qt.WindowType.Tool
+            )
+        self.setWindowFlags(self._base_window_flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)  # Don't steal focus
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Never accept keyboard focus
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         # Allow resize via mouse
         self._resize_edge = None
 
@@ -208,6 +231,93 @@ class RecordingWindow(QWidget):
         self._status_timer.setInterval(400)
 
         layout.addWidget(status_widget)
+
+        # Streaming transcript preview — shown during processing and result
+        self.transcript_preview = QLabel("")
+        self.transcript_preview.setWordWrap(True)
+        self.transcript_preview.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.transcript_preview.setStyleSheet(
+            """
+            color: #e2e8f0;
+            font-size: 12px;
+            background: rgba(132, 204, 22, 0.07);
+            border: 1px solid rgba(132, 204, 22, 0.2);
+            border-radius: 6px;
+            padding: 6px 8px;
+            """
+        )
+        self.transcript_preview.setMinimumHeight(40)
+        self.transcript_preview.setMaximumHeight(120)
+        self.transcript_preview.hide()
+        layout.addWidget(self.transcript_preview)
+
+        # Control buttons panel — always visible, changes per state
+        _btn_style_primary = """
+            QPushButton {
+                background: rgba(132, 204, 22, 0.15);
+                border: 1px solid rgba(132, 204, 22, 0.5);
+                border-radius: 6px;
+                color: #84cc16;
+                font-size: 12px;
+                font-weight: bold;
+                padding: 4px 12px;
+            }
+            QPushButton:hover { background: rgba(132, 204, 22, 0.3); }
+            QPushButton:disabled { opacity: 0.3; color: #555; border-color: #555; background: transparent; }
+        """
+        _btn_style_secondary = """
+            QPushButton {
+                background: rgba(255,255,255,0.06);
+                border: 1px solid rgba(255,255,255,0.15);
+                border-radius: 6px;
+                color: #888;
+                font-size: 12px;
+                padding: 4px 12px;
+            }
+            QPushButton:hover { background: rgba(255,255,255,0.12); color: #ccc; }
+            QPushButton:disabled { opacity: 0.3; }
+        """
+        _btn_style_danger = """
+            QPushButton {
+                background: rgba(239,68,68,0.1);
+                border: 1px solid rgba(239,68,68,0.35);
+                border-radius: 6px;
+                color: #f87171;
+                font-size: 12px;
+                padding: 4px 12px;
+            }
+            QPushButton:hover { background: rgba(239,68,68,0.22); }
+            QPushButton:disabled { opacity: 0.3; }
+        """
+
+        self.controls_widget = QWidget()
+        self.controls_widget.setStyleSheet("background: transparent;")
+        controls_layout = QHBoxLayout(self.controls_widget)
+        controls_layout.setContentsMargins(0, 2, 0, 2)
+        controls_layout.setSpacing(6)
+
+        self.btn_primary = QPushButton("▶ Start")
+        self.btn_primary.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_primary.setStyleSheet(_btn_style_primary)
+        self.btn_primary.setFixedHeight(28)
+        controls_layout.addWidget(self.btn_primary)
+
+        self.btn_secondary = QPushButton("✕ Cancel")
+        self.btn_secondary.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_secondary.setStyleSheet(_btn_style_secondary)
+        self.btn_secondary.setFixedHeight(28)
+        self.btn_secondary.hide()
+        controls_layout.addWidget(self.btn_secondary)
+
+        self.btn_repeat = QPushButton("↩ Repeat")
+        self.btn_repeat.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_repeat.setStyleSheet(_btn_style_secondary)
+        self.btn_repeat.setFixedHeight(28)
+        self.btn_repeat.setToolTip("Re-paste last transcription into focused window")
+        self.btn_repeat.hide()
+        controls_layout.addWidget(self.btn_repeat)
+
+        layout.addWidget(self.controls_widget)
 
         # More toggle button - chevron icon
         self.settings_btn = QPushButton()
@@ -565,6 +675,7 @@ class RecordingWindow(QWidget):
             self._current_mic_level = level
             self._update_sensitivity_style()
 
+
     def _animate_status(self) -> None:
         """Animate the status text with dots."""
         self._status_dots = (self._status_dots + 1) % 4
@@ -576,27 +687,17 @@ class RecordingWindow(QWidget):
         if self.settings_panel.isVisible():
             self.settings_panel.hide()
             self.settings_btn.setIcon(get_chevron_down_icon(20, "#84cc16"))
-            # Shrink window
             self.setFixedSize(self.config.window_width, self.config.window_height)
-            # Stop Claude status updates
             self._claude_status_timer.stop()
-            # Restore no-focus behavior for recording
-            self.setWindowFlags(self._base_window_flags | Qt.WindowType.WindowDoesNotAcceptFocus)
             self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            self.show()  # setWindowFlags hides the window, so re-show it
         else:
             self.settings_panel.show()
             self.settings_btn.setIcon(get_chevron_up_icon(20, "#84cc16"))
-            # Expand window - make it tall enough for all settings + taller history
             self.setFixedSize(self.config.window_width, self.config.window_height + 520)
-            # Refresh Claude status and start auto-update timer
             self._update_claude_status()
             self._claude_status_timer.start()
-            # Allow focus so user can edit settings
-            self.setWindowFlags(self._base_window_flags)
             self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-            self.show()  # setWindowFlags hides the window, so re-show it
-            self.activateWindow()  # Bring to front and activate
+            self.activateWindow()
 
     def _update_api_key_display(self) -> None:
         """Update the API key display based on visibility."""
@@ -779,93 +880,257 @@ class RecordingWindow(QWidget):
             self.claude_status.setText("Server error")
             self.claude_status.setStyleSheet("color: #f59e0b; font-size: 11px;")
 
-    def _refresh_history(self) -> None:
-        """Refresh the history list from config."""
-        self.history_list.clear()
-        for entry in self.config.history:
-            # Handle both old (string) and new (dict) formats
-            if isinstance(entry, dict):
-                text = entry.get("text", "")
-                timestamp = entry.get("timestamp", "")
-                audio_file = entry.get("audio_file", "")
-            else:
-                text = entry
-                timestamp = ""
-                audio_file = ""
+    def _make_history_widget(self, idx: int, entry) -> QWidget:
+        """Build a single history list widget for the given entry."""
+        _btn_icon_style = """
+            QPushButton {
+                background: transparent; border: none; border-radius: 4px;
+            }
+            QPushButton:hover { background: rgba(132, 204, 22, 0.2); }
+        """
 
-            # Format timestamp for display (date and time)
-            time_str = ""
-            if timestamp:
-                try:
-                    from datetime import datetime
+        if isinstance(entry, dict):
+            text = entry.get("text", "")
+            timestamp = entry.get("timestamp", "")
+            audio_file = entry.get("audio_file") or ""
+            status = entry.get("status", "ok")
+        else:
+            text = str(entry)
+            timestamp = ""
+            audio_file = ""
+            status = "ok"
 
-                    dt = datetime.fromisoformat(timestamp)
-                    time_str = dt.strftime("%b %d %H:%M") + " "  # "Dec 30 14:35"
-                except ValueError:
-                    pass
+        # Format timestamp
+        time_str = ""
+        if timestamp:
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(timestamp)
+                time_str = dt.strftime("%b %d %H:%M") + " "
+            except ValueError:
+                pass
 
-            # Create custom widget for this entry
-            widget = QWidget()
-            layout = QHBoxLayout(widget)
-            layout.setContentsMargins(4, 2, 4, 2)
-            layout.setSpacing(4)
+        widget = QWidget()
+        widget.setStyleSheet("background: transparent;")
+        row = QHBoxLayout(widget)
+        row.setContentsMargins(4, 2, 4, 2)
+        row.setSpacing(4)
 
-            # Text label (truncated)
-            display = text[:40] + "..." if len(text) > 40 else text
-            display = f"{time_str}{display}"
-            label = QLabel(display)
+        # Label — colour and text depend on status
+        if status == "recording":
+            label = QLabel(f"🎙️ {time_str}Recording...")
+            label.setStyleSheet("color: #84cc16; font-size: 11px;")
+            label.setToolTip("Recording in progress")
+        elif status == "transcribing":
+            label = QLabel(f"⏳ {time_str}Transcribing...")
+            label.setStyleSheet("color: #f59e0b; font-size: 11px;")
+            label.setToolTip("Transcription in progress")
+        elif status in ("failed", "empty"):
+            icon = "❌" if status == "failed" else "🔇"
+            hint = "API error" if status == "failed" else "No speech"
+            label = QLabel(f"🎙️{icon} {time_str}{hint}")
+            label.setStyleSheet("color: #f87171; font-size: 11px;")
+            label.setToolTip("Click 🔄 to retry transcription")
+        else:
+            display = (text[:40] + "…") if len(text) > 40 else text
+            label = QLabel(f"{time_str}{display}")
             label.setStyleSheet("color: #ccc; font-size: 11px;")
-            label.setToolTip(text)  # Full text on hover
-            layout.addWidget(label, stretch=1)
+            label.setToolTip(text)
 
-            # Copy button
+        row.addWidget(label, stretch=1)
+
+        # Copy button — only for successful entries with text
+        if status == "ok" and text:
             copy_btn = QPushButton()
             copy_btn.setIcon(get_copy_icon(14, "#888"))
             copy_btn.setFixedSize(24, 24)
             copy_btn.setToolTip("Copy to clipboard")
-            copy_btn.setStyleSheet(
+            copy_btn.setStyleSheet(_btn_icon_style)
+            copy_btn.clicked.connect(lambda checked, t=text: self._copy_history_item(t))
+            row.addWidget(copy_btn)
+
+        # Play button — whenever there is an audio file
+        if audio_file:
+            play_btn = QPushButton()
+            play_btn.setIcon(get_play_icon(14, "#888"))
+            play_btn.setFixedSize(24, 24)
+            play_btn.setToolTip("Play recording")
+            play_btn.setStyleSheet(_btn_icon_style)
+            play_btn.clicked.connect(
+                lambda checked, f=audio_file, b=play_btn: self._play_audio(f, b)
+            )
+            row.addWidget(play_btn)
+
+        # Retry button — any entry with audio (not just failed)
+        if audio_file and status != "recording":
+            retry_btn = QPushButton("🔄")
+            retry_btn.setFixedSize(28, 24)
+            retry_btn.setToolTip("Re-transcribe this recording")
+            retry_btn.setStyleSheet(
                 """
                 QPushButton {
-                    background: transparent;
-                    border: none;
+                    background: rgba(251,146,60,0.12);
+                    border: 1px solid rgba(251,146,60,0.35);
                     border-radius: 4px;
+                    color: #fb923c;
+                    font-size: 12px;
                 }
-                QPushButton:hover {
-                    background: rgba(132, 204, 22, 0.2);
-                }
-            """
-            )
-            copy_btn.clicked.connect(lambda checked, t=text: self._copy_history_item(t))
-            layout.addWidget(copy_btn)
-
-            # Play button (only if audio file exists)
-            if audio_file:
-                play_btn = QPushButton()
-                play_btn.setIcon(get_play_icon(14, "#888"))
-                play_btn.setFixedSize(24, 24)
-                play_btn.setToolTip("Play recording")
-                play_btn.setStyleSheet(
-                    """
-                    QPushButton {
-                        background: transparent;
-                        border: none;
-                        border-radius: 4px;
-                    }
-                    QPushButton:hover {
-                        background: rgba(132, 204, 22, 0.2);
-                    }
+                QPushButton:hover { background: rgba(251,146,60,0.28); }
                 """
-                )
-                play_btn.clicked.connect(
-                    lambda checked, f=audio_file, b=play_btn: self._play_audio(f, b)
-                )
-                layout.addWidget(play_btn)
+            )
+            retry_btn.clicked.connect(
+                lambda checked, f=audio_file, i=idx: self._on_retry_clicked(f, i)
+            )
+            row.addWidget(retry_btn)
 
-            # Add item to list
+        return widget
+
+    def _refresh_history(self) -> None:
+        """Rebuild the full history list."""
+        self.history_list.clear()
+        for idx, entry in enumerate(self.config.history):
+            widget = self._make_history_widget(idx, entry)
             item = QListWidgetItem()
             item.setSizeHint(widget.sizeHint())
             self.history_list.addItem(item)
             self.history_list.setItemWidget(item, widget)
+
+    def _update_history_item(self, idx: int) -> None:
+        """Update a single history row in-place (no full rebuild)."""
+        if idx < 0 or idx >= self.history_list.count():
+            return
+        entry = self.config.history[idx] if idx < len(self.config.history) else None
+        if entry is None:
+            return
+        widget = self._make_history_widget(idx, entry)
+        item = self.history_list.item(idx)
+        if item:
+            item.setSizeHint(widget.sizeHint())
+            self.history_list.setItemWidget(item, widget)
+
+
+    def update_controls(self, state: str) -> None:
+        """Update control buttons and status label based on app state."""
+        hotkey = self._hotkey_str
+
+        if state == "idle":
+            self.btn_primary.setText("▶ Start")
+            self.btn_primary.setEnabled(True)
+            self.btn_secondary.hide()
+            self.btn_repeat.hide()
+            self.set_status("Ready", animate=False)
+            self.hints_label.setText(f"Start: {hotkey}")
+
+        elif state == "recording":
+            self.btn_primary.setText("⏹ Stop")
+            self.btn_primary.setEnabled(True)
+            self.btn_secondary.setText("✕ Cancel")
+            self.btn_secondary.show()
+            self.btn_repeat.hide()
+            self.set_status("Listening", animate=True)
+            self.hints_label.setText(f"Stop: {hotkey}")
+
+        elif state == "transcribing":
+            self.btn_primary.setText("⏳ Processing...")
+            self.btn_primary.setEnabled(False)
+            self.btn_secondary.hide()
+            self.btn_repeat.hide()
+            self.set_status("Transcribing", animate=True)
+            self.hints_label.setText("")
+
+        elif state == "result":
+            self.btn_primary.setText("▶ New")
+            self.btn_primary.setEnabled(True)
+            self.btn_secondary.hide()
+            self.btn_repeat.show()
+            self.set_status("Done", animate=False)
+            self.hints_label.setText(f"New: {hotkey}")
+
+        elif state == "typing":
+            self.btn_primary.setText("✍ Typing...")
+            self.btn_primary.setEnabled(False)
+            self.btn_secondary.hide()
+            self.btn_repeat.hide()
+            self.set_status("Typing", animate=True)
+            self.hints_label.setText("")
+
+    def show_transcript_chunk(self, text: str) -> None:
+        """Show streaming transcript text in the preview widget."""
+        if not text:
+            return
+        # Truncate for display — keep last 200 chars so it fits in the widget
+        display = text if len(text) <= 200 else "…" + text[-200:]
+        self.transcript_preview.setText(display)
+        self.transcript_preview.setStyleSheet(
+            """
+            color: #e2e8f0;
+            font-size: 12px;
+            background: rgba(132, 204, 22, 0.07);
+            border: 1px solid rgba(132, 204, 22, 0.2);
+            border-radius: 6px;
+            padding: 6px 8px;
+            """
+        )
+        if not self.transcript_preview.isVisible():
+            self.transcript_preview.show()
+            new_h = self.config.window_height + 140
+            self.setFixedSize(self.config.window_width, new_h)
+
+    def show_result(self, text: str) -> None:
+        """Show final transcription result — keep window visible, style as done."""
+        if not text:
+            return
+        display = text if len(text) <= 300 else text[:300] + "…"
+        self.transcript_preview.setText(display)
+        # Green border — done state
+        self.transcript_preview.setStyleSheet(
+            """
+            color: #f0fdf4;
+            font-size: 12px;
+            background: rgba(132, 204, 22, 0.12);
+            border: 1px solid rgba(132, 204, 22, 0.5);
+            border-radius: 6px;
+            padding: 6px 8px;
+            """
+        )
+        if not self.transcript_preview.isVisible():
+            self.transcript_preview.show()
+            new_h = self.config.window_height + 140
+            self.setFixedSize(self.config.window_width, new_h)
+
+    def show_error_result(self, label: str) -> None:
+        """Show failed transcription result — keep window visible, style as error."""
+        self.transcript_preview.setText(label)
+        self.transcript_preview.setStyleSheet(
+            """
+            color: #fca5a5;
+            font-size: 12px;
+            background: rgba(239, 68, 68, 0.08);
+            border: 1px solid rgba(239, 68, 68, 0.35);
+            border-radius: 6px;
+            padding: 6px 8px;
+            """
+        )
+        if not self.transcript_preview.isVisible():
+            self.transcript_preview.show()
+            new_h = self.config.window_height + 140
+            self.setFixedSize(self.config.window_width, new_h)
+
+    def clear_transcript_preview(self) -> None:
+        """Hide and reset the transcript preview widget."""
+        self.transcript_preview.hide()
+        self.transcript_preview.setText("")
+        self.setFixedSize(self.config.window_width, self.config.window_height)
+
+    def set_retranscribe_callback(self, callback) -> None:
+        """Set the callback for retranscribe button clicks."""
+        self._retranscribe_callback = callback
+
+    def _on_retry_clicked(self, audio_file: str, entry_index: int) -> None:
+        """Handle retry button click — delegate to main app."""
+        cb = getattr(self, "_retranscribe_callback", None)
+        if cb:
+            cb(audio_file, entry_index)
 
     def _copy_history_item(self, text: str) -> None:
         """Copy a history item to clipboard."""
@@ -959,6 +1224,36 @@ class RecordingWindow(QWidget):
         """Handle mouse release."""
         self._drag_pos = None
 
+    def showEvent(self, event) -> None:
+        """Set NSWindow collection behavior on every show to prevent focus stealing."""
+        super().showEvent(event)
+        if sys.platform == "darwin":
+            QTimer.singleShot(0, self._set_macos_no_focus_behavior)
+
+    def _set_macos_no_focus_behavior(self) -> None:
+        """Configure NSWindow so it never steals focus and stays above other windows.
+
+        Uses PyObjC objc_object to get the real NSWindow from Qt's NSView pointer.
+        - NSWindowCollectionBehaviorStationary (1<<4): shown without stealing focus
+        - NSWindowCollectionBehaviorIgnoresCycle (1<<6): excluded from Cmd+Tab
+        - NSWindowCollectionBehaviorCanJoinAllSpaces (1<<0): visible on all spaces
+        - NSFloatingWindowLevel: always on top
+        """
+        try:
+            import objc as pyobjc
+            from AppKit import NSFloatingWindowLevel
+
+            ns_view = pyobjc.objc_object(c_void_p=int(self.winId()))
+            ns_window = ns_view.window()
+            if ns_window is None:
+                return
+
+            NO_FOCUS = (1 << 4) | (1 << 6) | (1 << 0)
+            ns_window.setCollectionBehavior_(NO_FOCUS)
+            ns_window.setLevel_(NSFloatingWindowLevel)
+        except Exception as e:
+            print(f"macOS no-focus behavior: {e}")
+
 
 class TurboWhisper:
     """Main application class."""
@@ -967,7 +1262,7 @@ class TurboWhisper:
         self.config = Config.load()
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
-        self.app.setWindowIcon(get_tray_icon(128, recording=False))  # Orange when idle
+        self.app.setWindowIcon(get_tray_icon(128, recording=False))
 
         # Components
         self.recorder = AudioRecorder(self.config)
@@ -977,17 +1272,37 @@ class TurboWhisper:
 
         # UI
         self.window = RecordingWindow(self.config)
+        self.window.set_retranscribe_callback(self._retranscribe)
         self._setup_tray()
 
-        # State
-        self.is_recording = False
-        self._pending_waveform_data = None  # Thread-safe buffer for waveform data
+        # State machine — single source of truth
+        self._state = AppState.IDLE
+        self._transcribing = False          # guard against double transcription
+        self._pending_audio_filename: str | None = None
+        self._retranscribe_entry_index: int | None = None
+        self._last_toggle_time: float = 0.0
+        self._last_text: str = ""           # for Repeat button
+        self._current_history_idx: int | None = None  # live history entry
+        self._pending_waveform_data = None
+
+        # Wire up buttons
+        self.window.btn_primary.clicked.connect(self._on_primary_btn)
+        self.window.btn_secondary.clicked.connect(self._cancel_recording)
+        self.window.btn_repeat.clicked.connect(self._repeat_last)
 
         # Connect signals
         self.signals.toggle_recording.connect(self._toggle_recording)
         self.signals.transcription_complete.connect(self._on_transcription_complete)
         self.signals.transcription_error.connect(self._on_transcription_error)
+        self.signals.transcription_chunk.connect(self._on_transcription_chunk)
         self.signals.show_status.connect(self.window.set_status)
+        self.signals.state_changed.connect(self.window.update_controls)
+        self.signals.set_app_state.connect(
+            lambda s: self._set_state(AppState(s))
+        )
+        self.signals.show_window.connect(self.window.show)
+        self.signals.hide_window.connect(self.window.hide)
+        self.signals.tray_message.connect(self._show_tray_message)
         self.window.cancel_requested.connect(self._cancel_recording)
 
         # Timer to poll waveform data from recorder thread (avoids cross-thread signal issues)
@@ -1060,6 +1375,51 @@ class TurboWhisper:
         self.tray.setIcon(get_tray_icon(64, recording=recording))
         self.window.update_icon(recording=recording)
 
+    def _show_tray_message(self, title: str, message: str, duration_ms: int) -> None:
+        """Show tray notification — must be called from main thread."""
+        self.tray.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, duration_ms)
+
+    def _set_state(self, state: AppState) -> None:
+        """Centralized state transition — updates all UI in one place."""
+        self._state = state
+        recording = state == AppState.RECORDING
+        self._update_icons(recording=recording)
+        self.signals.state_changed.emit(state.value)
+        # Tray menu label
+        if state == AppState.RECORDING:
+            self.toggle_action.setText("Stop Recording")
+        elif state in (AppState.TRANSCRIBING, AppState.TYPING):
+            self.toggle_action.setText("Processing...")
+        else:
+            self.toggle_action.setText("Start Recording")
+
+    def _on_primary_btn(self) -> None:
+        """Handle primary button click — behaviour depends on current state."""
+        if self._state == AppState.IDLE:
+            self._start_recording()
+        elif self._state == AppState.RECORDING:
+            self._stop_recording()
+        elif self._state == AppState.RESULT:
+            self._start_recording()
+
+    def _repeat_last(self) -> None:
+        """Re-paste the last transcription into the focused window."""
+        if not self._last_text:
+            return
+        text = self._last_text
+        self._set_state(AppState.TYPING)
+
+        def _do_paste(t=text):
+            time.sleep(0.05)
+            if self._wait_for_claude_ready():
+                self.typer.type_text(t)
+            else:
+                self.typer.copy_to_clipboard(t)
+            self.signals.set_app_state.emit(AppState.IDLE.value)
+            self.signals.hide_window.emit()
+
+        threading.Thread(target=_do_paste, daemon=True).start()
+
     def _save_wav(self, path, audio_data: bytes) -> None:
         """Save audio data as a WAV file."""
         import wave
@@ -1071,79 +1431,93 @@ class TurboWhisper:
             wf.writeframes(audio_data)
 
     def _show_window(self) -> None:
-        """Show the window without starting recording (doesn't steal focus)."""
+        """Show the window without stealing focus."""
         self.window.waveform.set_recording(False)
         self.window.set_recording_hint(recording=False)
-        self._update_icons(recording=False)
-        self.window.set_status("Ready", animate=False)
         self.window.center_on_screen()
         self.window.show()
-        self.window.raise_()
-        # Note: Don't call activateWindow() - keeps focus in user's original app
 
     def _show_settings(self) -> None:
         """Show the window with settings panel expanded (takes focus for editing)."""
         self._show_window()
-        # Expand settings if not already visible
         if not self.window.settings_panel.isVisible():
             self.window._toggle_settings()
-        # Take focus so user can edit settings fields
         self.window.activateWindow()
 
     def _toggle_recording(self) -> None:
-        """Toggle recording state."""
-        if self.is_recording:
+        """Hotkey handler — debounced, delegates to state machine."""
+        now = time.monotonic()
+        if now - self._last_toggle_time < 0.3:
+            return
+        self._last_toggle_time = now
+
+        if self._state == AppState.RECORDING:
             self._stop_recording()
-        else:
+        elif self._state in (AppState.IDLE, AppState.RESULT):
             self._start_recording()
+        # TRANSCRIBING / TYPING — ignore hotkey, not safe to interrupt
 
     def _start_recording(self) -> None:
         """Start recording audio."""
-        if self.is_recording:
+        if self._state == AppState.RECORDING:
             return
 
-        self.is_recording = True
-        self.toggle_action.setText("Stop Recording")
-        self._update_icons(recording=True)
-
-        # Show window (don't steal focus from current app)
+        self._set_state(AppState.RECORDING)
+        self.window.clear_transcript_preview()
         self.window.waveform.set_recording(True)
         self.window.set_recording_hint(recording=True)
-        self.window.set_status("Listening", animate=True)
 
-        # Hide settings panel if open (it changes window focus behavior)
+        # Add live entry to history immediately so user can see it
+        from datetime import datetime
+        live_entry = {
+            "text": "",
+            "timestamp": datetime.now().isoformat(),
+            "audio_file": None,
+            "status": "recording",
+        }
+        self.config.history.insert(0, live_entry)
+        self._current_history_idx = 0
+        self.window._refresh_history()
+
         if self.window.settings_panel.isVisible():
             self.window._toggle_settings()
 
         self.window.center_on_screen()
         self.window.show()
-        self.window.raise_()
 
-        # Start waveform polling timer
         self._pending_waveform_data = None
         self._waveform_timer.start()
-
-        # Start recording
         self.recorder.start(level_callback=self._on_audio_level)
 
     def _cancel_recording(self) -> None:
-        """Cancel recording without transcribing."""
-        if not self.is_recording:
+        """Cancel recording (ESC / Cancel button). Also closes window in RESULT state."""
+        if self._state == AppState.RESULT:
+            self.window.clear_transcript_preview()
+            self.window.hide()
+            self._set_state(AppState.IDLE)
             return
 
-        self.is_recording = False
-        self.toggle_action.setText("Start Recording")
-        self._update_icons(recording=False)
+        if self._state != AppState.RECORDING:
+            return
 
-        # Stop waveform polling
         self._waveform_timer.stop()
-
-        # Stop recording and discard audio
         self.recorder.stop()
 
-        # Hide window
+        # Remove the live "recording" history entry we added
+        if self._current_history_idx is not None:
+            try:
+                entry = self.config.history[self._current_history_idx]
+                if isinstance(entry, dict) and entry.get("status") == "recording":
+                    self.config.history.pop(self._current_history_idx)
+                    self.window._refresh_history()
+            except IndexError:
+                pass
+        self._current_history_idx = None
+
         self.window.waveform.set_recording(False)
+        self.window.clear_transcript_preview()
         self.window.hide()
+        self._set_state(AppState.IDLE)
 
         self.tray.showMessage(
             "Turbo Whisper",
@@ -1153,46 +1527,47 @@ class TurboWhisper:
         )
 
     def _stop_recording(self) -> None:
-        """Stop recording and transcribe."""
-        if not self.is_recording:
+        """Stop recording and start transcription."""
+        if self._state != AppState.RECORDING:
+            return
+        if self._transcribing:
             return
 
-        self.is_recording = False
-        self.toggle_action.setText("Start Recording")
-        self._update_icons(recording=False)
-
-        # Stop waveform polling
         self._waveform_timer.stop()
-
-        # Update UI
         self.window.waveform.set_recording(False)
         self.window.set_recording_hint(recording=False)
-        self.window.set_status("Processing", animate=True)
+        self._set_state(AppState.TRANSCRIBING)
 
-        # Stop recording and get audio
         audio_data = self.recorder.stop()
 
-        # Save audio to file if configured
+        # Save audio immediately so retry is always possible
         audio_filename = None
-        if self.config.store_recordings and audio_data:
+        if audio_data:
             from datetime import datetime
-
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-            audio_filename = f"{timestamp}.wav"
+            ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            audio_filename = f"{ts}.wav"
             audio_path = self.config.get_recordings_dir() / audio_filename
             try:
                 self._save_wav(audio_path, audio_data)
+                # Update live history entry with audio filename
+                if self._current_history_idx is not None:
+                    try:
+                        self.config.history[self._current_history_idx]["audio_file"] = audio_filename
+                    except (IndexError, TypeError):
+                        pass
             except Exception as e:
                 print(f"Warning: Could not save audio: {e}")
                 audio_filename = None
 
-        # Store for use in transcription callback
         self._pending_audio_filename = audio_filename
+        self._transcribing = True
 
-        # Transcribe in background thread
         def transcribe():
             try:
-                text = self.client.transcribe_sync(audio_data)
+                text = self.client.transcribe_stream(
+                    audio_data,
+                    chunk_callback=lambda chunk: self.signals.transcription_chunk.emit(chunk),
+                )
                 self.signals.transcription_complete.emit(text)
             except WhisperAPIError as e:
                 self.signals.transcription_error.emit(str(e))
@@ -1254,77 +1629,175 @@ class TurboWhisper:
             time.sleep(0.1)
         return False
 
+    def _on_transcription_chunk(self, text: str) -> None:
+        """Streaming chunk — update preview and live history entry."""
+        self.window.show_transcript_chunk(text)
+        # Update live history item text without full rebuild
+        if self._current_history_idx is not None:
+            try:
+                self.config.history[self._current_history_idx]["text"] = text
+                self.window._update_history_item(self._current_history_idx)
+            except (IndexError, TypeError):
+                pass
+
     def _on_transcription_complete(self, text: str) -> None:
         """Handle completed transcription."""
-        self.window.hide()
-
-        # Get the audio filename that was saved during _stop_recording
-        audio_filename = getattr(self, "_pending_audio_filename", None)
+        self._transcribing = False
+        audio_filename = self._pending_audio_filename
         self._pending_audio_filename = None
 
-        if text:
-            # Save to history (with audio file if available)
-            self.config.add_to_history(text, audio_file=audio_filename)
-            self.window._refresh_history()
+        # For retranscribe: remove old entry first (it will be replaced)
+        retranscribe_index = self._retranscribe_entry_index
+        self._retranscribe_entry_index = None
+        if retranscribe_index is not None and 0 <= retranscribe_index < len(self.config.history):
+            self.config.history.pop(retranscribe_index)
+            # live idx shifted by removal
+            if self._current_history_idx is not None and retranscribe_index < self._current_history_idx:
+                self._current_history_idx -= 1
 
-            # Copy to clipboard
+        if text:
+            self._last_text = text
+
+            if not self.config.store_recordings and audio_filename:
+                try:
+                    (self.config.get_recordings_dir() / audio_filename).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                audio_filename = None
+
+            # Update live history entry in-place
+            if self._current_history_idx is not None:
+                try:
+                    entry = self.config.history[self._current_history_idx]
+                    entry["text"] = text
+                    entry["status"] = "ok"
+                    if audio_filename:
+                        entry["audio_file"] = audio_filename
+                    self.config.save()
+                    self.window._refresh_history()
+                except (IndexError, TypeError):
+                    self.config.add_to_history(text, audio_file=audio_filename)
+                    self.window._refresh_history()
+            else:
+                self.config.add_to_history(text, audio_file=audio_filename)
+                self.window._refresh_history()
+
+            self._current_history_idx = None
+            self.window.show_result(text)
+            self._set_state(AppState.RESULT)
+
             if self.config.copy_to_clipboard:
                 self.typer.copy_to_clipboard(text)
 
-            # Type into focused window (wait for Claude if running)
+            # Paste in background thread — never blocks Qt main thread
             if self.config.auto_paste:
-                if self._wait_for_claude_ready():
-                    self.typer.type_text(text)
-                    self.tray.showMessage(
-                        "Turbo Whisper",
-                        f"Transcribed: {text[:50]}..."
-                        if len(text) > 50
-                        else f"Transcribed: {text}",
-                        QSystemTrayIcon.MessageIcon.Information,
-                        2000,
-                    )
-                else:
-                    # Timeout waiting for Claude - just show copied message
-                    self.tray.showMessage(
-                        "Turbo Whisper",
-                        "Copied (Claude busy)",
-                        QSystemTrayIcon.MessageIcon.Information,
-                        2000,
-                    )
-            else:
-                self.tray.showMessage(
-                    "Turbo Whisper",
-                    f"Transcribed: {text[:50]}..."
-                    if len(text) > 50
-                    else f"Transcribed: {text}",
-                    QSystemTrayIcon.MessageIcon.Information,
-                    2000,
-                )
+                self._set_state(AppState.TYPING)
+
+                def _paste_async(t=text):
+                    time.sleep(0.05)
+                    if self._wait_for_claude_ready():
+                        self.typer.type_text(t)
+                    else:
+                        self.signals.tray_message.emit("Turbo Whisper", "Copied (Claude busy)", 2000)
+                    # Hide window after paste — user can bring it back with ESC/Cancel
+                    self.signals.set_app_state.emit(AppState.IDLE.value)
+                    self.signals.hide_window.emit()
+
+                threading.Thread(target=_paste_async, daemon=True).start()
         else:
-            # Transcription failed - delete saved audio if any
-            if audio_filename:
-                audio_path = self.config.get_recordings_dir() / audio_filename
-                if audio_path.exists():
-                    try:
-                        audio_path.unlink()
-                    except OSError:
-                        pass
+            # No speech detected
+            if self._current_history_idx is not None:
+                try:
+                    entry = self.config.history[self._current_history_idx]
+                    entry["status"] = "empty"
+                    self.config.save()
+                    self.window._refresh_history()
+                except (IndexError, TypeError):
+                    if audio_filename:
+                        self.config.add_failed_to_history(audio_filename, status="empty")
+                        self.window._refresh_history()
+            self._current_history_idx = None
+            self.window.show_error_result("🔇 No speech detected")
+            self._set_state(AppState.RESULT)
             self.tray.showMessage(
                 "Turbo Whisper",
-                "No speech detected",
+                "No speech detected — saved for retry",
                 QSystemTrayIcon.MessageIcon.Warning,
                 2000,
             )
 
     def _on_transcription_error(self, error: str) -> None:
         """Handle transcription error."""
-        self.window.hide()
+        self._transcribing = False
+        audio_filename = self._pending_audio_filename
+        self._pending_audio_filename = None
+
+        if self._current_history_idx is not None:
+            try:
+                entry = self.config.history[self._current_history_idx]
+                entry["status"] = "failed"
+                self.config.save()
+                self.window._refresh_history()
+            except (IndexError, TypeError):
+                if audio_filename:
+                    self.config.add_failed_to_history(audio_filename, status="failed")
+                    self.window._refresh_history()
+        self._current_history_idx = None
+
+        short_error = error[:60] + "…" if len(error) > 60 else error
+        self.window.show_error_result(f"❌ {short_error}")
+        self._set_state(AppState.RESULT)
+
         self.tray.showMessage(
             "Turbo Whisper - Error",
             error,
             QSystemTrayIcon.MessageIcon.Critical,
             3000,
         )
+
+    def _retranscribe(self, audio_filename: str, entry_index: int) -> None:
+        """Re-send a saved audio file to Whisper for transcription."""
+        if self._state == AppState.RECORDING or self._transcribing:
+            return
+
+        audio_path = self.config.get_recordings_dir() / audio_filename
+        if not audio_path.exists():
+            self.tray.showMessage(
+                "Turbo Whisper", "Audio file not found",
+                QSystemTrayIcon.MessageIcon.Warning, 2000,
+            )
+            return
+
+        import wave
+        try:
+            with wave.open(str(audio_path), "rb") as wf:
+                audio_data = wf.readframes(wf.getnframes())
+        except Exception as e:
+            self.tray.showMessage(
+                "Turbo Whisper", f"Cannot read audio: {e}",
+                QSystemTrayIcon.MessageIcon.Critical, 2000,
+            )
+            return
+
+        self._pending_audio_filename = audio_filename
+        self._retranscribe_entry_index = entry_index
+        self._current_history_idx = entry_index
+        self._transcribing = True
+        self._set_state(AppState.TRANSCRIBING)
+        self.window.clear_transcript_preview()
+        self.window.show()
+
+        def transcribe():
+            try:
+                text = self.client.transcribe_stream(
+                    audio_data,
+                    chunk_callback=lambda chunk: self.signals.transcription_chunk.emit(chunk),
+                )
+                self.signals.transcription_complete.emit(text)
+            except WhisperAPIError as e:
+                self.signals.transcription_error.emit(str(e))
+
+        threading.Thread(target=transcribe, daemon=True).start()
 
     def _quit(self) -> None:
         """Clean up and quit application."""

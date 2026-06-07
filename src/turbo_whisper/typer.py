@@ -169,18 +169,89 @@ class Typer:
 
     def _type_pyautogui(self, text: str) -> bool:
         """Type text using PyAutoGUI (Windows/macOS)."""
-        try:
-            import time
+        import time
 
+        # Small delay to let focus settle
+        time.sleep(0.1)
+
+        # On macOS, pyautogui.write() cannot type Cyrillic or other non-ASCII
+        # characters reliably. Use clipboard + paste instead.
+        if self.system == "Darwin":
+            return self._paste_darwin(text)
+
+        try:
             import pyautogui
 
-            # Small delay to let focus settle
-            time.sleep(0.1)
             pyautogui.write(text, interval=0.01)
             return True
         except Exception as e:
             print(f"PyAutoGUI typing error: {e}")
             return self.copy_to_clipboard(text)
+
+    def _paste_darwin(self, text: str) -> bool:
+        """Paste text on macOS via clipboard + Cmd+V using CGEventPost.
+
+        CGEventPost works at the HID level — no focus change, no layout issues.
+        keycode 9 = 'v' in US layout, but Cmd+V is intercepted by the OS before
+        layout remapping, so it always triggers paste regardless of input language.
+        """
+        import time
+
+        try:
+            from Quartz import (
+                CGEventCreateKeyboardEvent,
+                CGEventPost,
+                CGEventSetFlags,
+                kCGEventFlagMaskCommand,
+                kCGHIDEventTap,
+            )
+
+            # Save current clipboard
+            old_clipboard = self._get_clipboard_darwin()
+
+            # Copy text to clipboard
+            if not self.copy_to_clipboard(text):
+                return False
+
+            time.sleep(0.05)
+
+            # keycode 9 = V key (physical, layout-independent)
+            V_KEY = 9
+
+            # Cmd+V key down
+            event_down = CGEventCreateKeyboardEvent(None, V_KEY, True)
+            CGEventSetFlags(event_down, kCGEventFlagMaskCommand)
+            CGEventPost(kCGHIDEventTap, event_down)
+
+            # Cmd+V key up
+            event_up = CGEventCreateKeyboardEvent(None, V_KEY, False)
+            CGEventSetFlags(event_up, kCGEventFlagMaskCommand)
+            CGEventPost(kCGHIDEventTap, event_up)
+
+            time.sleep(0.05)
+
+            # Restore original clipboard content
+            if old_clipboard is not None:
+                self.copy_to_clipboard(old_clipboard)
+
+            return True
+        except Exception as e:
+            print(f"macOS paste error: {e}")
+            return self.copy_to_clipboard(text)
+
+    def _get_clipboard_darwin(self) -> str | None:
+        """Get current clipboard content on macOS."""
+        try:
+            proc = subprocess.Popen(
+                ["pbpaste"],
+                stdout=subprocess.PIPE,
+            )
+            stdout, _ = proc.communicate()
+            if proc.returncode == 0:
+                return stdout.decode("utf-8")
+        except Exception:
+            pass
+        return None
 
     def _type_linux(self, text: str) -> bool:
         """Type text on Linux using evdev UInput."""
